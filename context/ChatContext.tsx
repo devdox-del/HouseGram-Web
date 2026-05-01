@@ -575,12 +575,22 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
     if (!trimmed) return text;
 
     const systemPrompt =
-      'Ты — редактор-корректор в мессенджере HouseGram. Получаешь черновик сообщения и возвращаешь улучшенную версию: исправляешь грамматику, орфографию и пунктуацию, делаешь формулировку более ясной и естественной, сохраняешь исходный язык, тон и эмодзи. Никогда не добавляй пояснений, кавычек или префиксов вроде «Исправлено:» — отвечай только готовым текстом сообщения.';
+      'Исправь грамматику, орфографию и пунктуацию в тексте. Сохрани язык, тон и эмодзи. Верни только готовый исправленный текст без пояснений и кавычек.';
 
     const cleanResponse = (raw: string): string => {
       const cleaned = raw.trim().replace(/^["«]+|["»]+$/g, '').trim();
       if (!cleaned) throw new Error('AI вернул пустой ответ');
       return cleaned;
+    };
+
+    const looksLikeDeprecationNotice = (s: string) => {
+      const lower = s.toLowerCase();
+      return (
+        s.includes('IMPORTANT NOTICE') ||
+        lower.includes('deprecated') ||
+        lower.includes('pollinations legacy') ||
+        s.startsWith('⚠')
+      );
     };
 
     // Primary: free, no-key Pollinations.ai (OpenAI-compatible).
@@ -589,26 +599,57 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'openai',
           messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: trimmed },
+            { role: 'user', content: `${systemPrompt}\n\nТекст: ${trimmed}` },
           ],
-          temperature: 0.4,
         }),
       });
       if (!res.ok) throw new Error(`Pollinations HTTP ${res.status}`);
       const data = await res.json();
       const content = data?.choices?.[0]?.message?.content;
       if (typeof content === 'string' && content.trim()) {
+        if (looksLikeDeprecationNotice(content)) {
+          throw new Error('Pollinations вернул системное уведомление, пробуем резервный сервис');
+        }
         return cleanResponse(content);
       }
       throw new Error('Pollinations вернул пустой ответ');
     } catch (pollErr) {
-      console.warn('Pollinations AI failed, trying Gemini fallback', pollErr);
+      console.warn('Pollinations AI failed, trying LanguageTool fallback', pollErr);
     }
 
-    // Fallback: Gemini, if a key is configured.
+    // Fallback 1: LanguageTool — free, no-key grammar/spell-check API.
+    try {
+      const params = new URLSearchParams();
+      params.set('text', trimmed);
+      params.set('language', 'auto');
+      const res = await fetch('https://api.languagetool.org/v2/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      });
+      if (!res.ok) throw new Error(`LanguageTool HTTP ${res.status}`);
+      const data = await res.json();
+      const matches: Array<{ offset: number; length: number; replacements: { value: string }[] }> =
+        Array.isArray(data?.matches) ? data.matches : [];
+      const valid = matches
+        .filter((m) => Array.isArray(m?.replacements) && m.replacements.length > 0 && typeof m.offset === 'number' && typeof m.length === 'number')
+        .sort((a, b) => b.offset - a.offset);
+      if (valid.length === 0) {
+        // No corrections suggested — return as-is so the user knows it was checked.
+        return trimmed;
+      }
+      let result = trimmed;
+      for (const m of valid) {
+        const replacement = m.replacements[0].value;
+        result = result.slice(0, m.offset) + replacement + result.slice(m.offset + m.length);
+      }
+      return cleanResponse(result);
+    } catch (ltErr) {
+      console.warn('LanguageTool failed, trying Gemini fallback', ltErr);
+    }
+
+    // Fallback 2: Gemini, if a key is configured.
     const ai = getAi();
     if (!ai) {
       throw new Error('AI временно недоступен. Попробуйте ещё раз через минуту.');
