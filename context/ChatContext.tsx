@@ -573,22 +573,52 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
   const improveWithAI = useCallback(async (text: string): Promise<string> => {
     const trimmed = text.trim();
     if (!trimmed) return text;
+
+    const systemPrompt =
+      'Ты — редактор-корректор в мессенджере HouseGram. Получаешь черновик сообщения и возвращаешь улучшенную версию: исправляешь грамматику, орфографию и пунктуацию, делаешь формулировку более ясной и естественной, сохраняешь исходный язык, тон и эмодзи. Никогда не добавляй пояснений, кавычек или префиксов вроде «Исправлено:» — отвечай только готовым текстом сообщения.';
+
+    const cleanResponse = (raw: string): string => {
+      const cleaned = raw.trim().replace(/^["«]+|["»]+$/g, '').trim();
+      if (!cleaned) throw new Error('AI вернул пустой ответ');
+      return cleaned;
+    };
+
+    // Primary: free, no-key Pollinations.ai (OpenAI-compatible).
+    try {
+      const res = await fetch('https://text.pollinations.ai/openai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'openai',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: trimmed },
+          ],
+          temperature: 0.4,
+        }),
+      });
+      if (!res.ok) throw new Error(`Pollinations HTTP ${res.status}`);
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content === 'string' && content.trim()) {
+        return cleanResponse(content);
+      }
+      throw new Error('Pollinations вернул пустой ответ');
+    } catch (pollErr) {
+      console.warn('Pollinations AI failed, trying Gemini fallback', pollErr);
+    }
+
+    // Fallback: Gemini, if a key is configured.
     const ai = getAi();
     if (!ai) {
-      throw new Error('AI недоступен: не настроен NEXT_PUBLIC_GEMINI_API_KEY.');
+      throw new Error('AI временно недоступен. Попробуйте ещё раз через минуту.');
     }
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: trimmed,
-      config: {
-        systemInstruction:
-          'Ты — редактор-корректор в мессенджере HouseGram. Получаешь черновик сообщения и возвращаешь улучшенную версию: исправляешь грамматику, орфографию и пунктуацию, делаешь формулировку более ясной и естественной, сохраняешь исходный язык, тон и эмодзи. Никогда не добавляй пояснений, кавычек или префиксов вроде «Исправлено:» — отвечай только готовым текстом сообщения.',
-        temperature: 0.4,
-      },
+      config: { systemInstruction: systemPrompt, temperature: 0.4 },
     });
-    const improved = (response.text || '').trim();
-    if (!improved) throw new Error('AI вернул пустой ответ');
-    return improved.replace(/^["«]+|["»]+$/g, '');
+    return cleanResponse(response.text || '');
   }, []);
 
   const updateMessageText = useCallback(async (contactId: string, messageId: string, newText: string) => {
