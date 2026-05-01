@@ -2,7 +2,7 @@
 
 import { useChat } from '@/context/ChatContext';
 import { motion } from 'motion/react';
-import { ArrowLeft, Shield, MessageSquare, Zap } from 'lucide-react';
+import { ArrowLeft, Shield, MessageSquare, Zap, Sparkles } from 'lucide-react';
 
 export default function FeaturesView() {
   const { setView, themeColor } = useChat();
@@ -30,6 +30,34 @@ export default function FeaturesView() {
           </div>
           <h2 className="text-xl font-medium text-black mb-2">Демонстрация функций</h2>
           <p className="text-gray-500 text-sm">Посмотрите, как работает HouseGram на реальных примерах</p>
+        </div>
+
+        <div className="bg-gradient-to-br from-violet-50 to-fuchsia-50 rounded-xl p-4 border border-violet-100">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-gradient-to-br from-violet-500 to-fuchsia-500 rounded-lg text-white">
+              <Sparkles size={20} />
+            </div>
+            <h3 className="font-medium text-black">AI исправление сообщений</h3>
+            <span className="ml-auto text-[11px] font-semibold text-violet-600 bg-white px-2 py-0.5 rounded-full border border-violet-200">
+              1 день бесплатно
+            </span>
+          </div>
+          <p className="text-sm text-gray-700 mb-4">
+            Нажмите на иконку волшебной палочки рядом с полем ввода — и AI исправит грамматику, орфографию и сделает текст естественнее. Также можно тапнуть по своему отправленному сообщению, чтобы исправить уже опубликованный текст.
+          </p>
+          <div className="bg-white rounded-lg p-3 shadow-sm border border-gray-100">
+            <div className="flex flex-col gap-2">
+              <div className="bg-gray-100 text-gray-500 line-through rounded-2xl rounded-tr-sm px-3 py-2 text-sm self-end max-w-[80%]">
+                привет как дилаа в выходные пойдём в кино?
+              </div>
+              <div className="self-end text-[11px] text-violet-500 flex items-center gap-1">
+                <Sparkles size={12} /> AI исправил
+              </div>
+              <div className="bg-violet-50 text-violet-900 rounded-2xl rounded-tr-sm px-3 py-2 text-sm self-end max-w-[80%] border border-violet-100">
+                Привет! Как дела? В выходные пойдём в кино?
+              </div>
+            </div>
+          </div>
         </div>
 
         <div className="bg-gray-50 rounded-xl p-4 border border-gray-100">

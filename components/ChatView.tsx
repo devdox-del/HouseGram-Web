@@ -2,7 +2,7 @@
 
 import { useChat } from '@/context/ChatContext';
 import { motion, AnimatePresence } from 'motion/react';
-import { ArrowLeft, Paperclip, Send, Mic, MoreVertical, Check, CheckCheck, Clock, Smile, Image as ImageIcon, Music, File, Square, Bookmark, CheckCircle, BadgeCheck } from 'lucide-react';
+import { ArrowLeft, Paperclip, Send, Mic, MoreVertical, Check, CheckCheck, Clock, Smile, Image as ImageIcon, Music, File, Square, Bookmark, CheckCircle, BadgeCheck, Sparkles, Wand2, Loader2, X } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import Image from 'next/image';
 import EmojiPicker, { EmojiStyle } from 'emoji-picker-react';
@@ -16,13 +16,34 @@ const isOnlyEmojis = (str: string) => {
 };
 
 export default function ChatView() {
-  const { contacts, activeChatId, setView, sendMessage, themeColor, wallpaper, isGlassEnabled, clearHistory, deleteChat } = useChat();
+  const {
+    contacts,
+    activeChatId,
+    setView,
+    sendMessage,
+    themeColor,
+    wallpaper,
+    isGlassEnabled,
+    clearHistory,
+    deleteChat,
+    improveWithAI,
+    updateMessageText,
+    isAiTrialActive,
+    aiTrialMsLeft,
+    aiTrialStart,
+    startAiTrial,
+  } = useChat();
   const [inputText, setInputText] = useState('');
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [showClearModal, setShowClearModal] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const [aiFixingInput, setAiFixingInput] = useState(false);
+  const [aiActionMessageId, setAiActionMessageId] = useState<string | null>(null);
+  const [aiFixingMessageId, setAiFixingMessageId] = useState<string | null>(null);
+  const [showPaywall, setShowPaywall] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
   
   // Recording state
   const [isRecording, setIsRecording] = useState(false);
@@ -53,6 +74,12 @@ export default function ChatView() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!aiError) return;
+    const t = setTimeout(() => setAiError(null), 4000);
+    return () => clearTimeout(t);
+  }, [aiError]);
+
   if (!contact) return null;
 
   const handleSend = () => {
@@ -65,6 +92,63 @@ export default function ChatView() {
 
   const handleEmojiClick = (emojiData: any) => {
     setInputText(prev => prev + emojiData.emoji);
+  };
+
+  const ensureAiAccess = (): boolean => {
+    if (!aiTrialStart) {
+      startAiTrial();
+      return true;
+    }
+    if (!isAiTrialActive()) {
+      setShowPaywall(true);
+      return false;
+    }
+    return true;
+  };
+
+  const formatTrialLeft = (ms: number) => {
+    const totalMin = Math.max(0, Math.ceil(ms / 60000));
+    if (totalMin <= 0) return '0 минут';
+    const hours = Math.floor(totalMin / 60);
+    const minutes = totalMin % 60;
+    if (hours > 0) return `${hours} ч ${minutes} мин`;
+    return `${minutes} мин`;
+  };
+
+  const handleAiFixInput = async () => {
+    const text = inputText.trim();
+    if (!text || aiFixingInput) return;
+    if (!ensureAiAccess()) return;
+    setAiFixingInput(true);
+    setAiError(null);
+    try {
+      const improved = await improveWithAI(text);
+      setInputText(improved);
+    } catch (e) {
+      console.error('AI improve error', e);
+      setAiError(e instanceof Error ? e.message : 'Не удалось улучшить текст');
+    } finally {
+      setAiFixingInput(false);
+    }
+  };
+
+  const handleAiFixMessage = async (messageId: string, originalText: string) => {
+    if (!activeChatId) return;
+    setAiActionMessageId(null);
+    if (!ensureAiAccess()) return;
+    setAiFixingMessageId(messageId);
+    setAiError(null);
+    try {
+      const improved = await improveWithAI(originalText);
+      if (improved && improved !== originalText) {
+        await updateMessageText(activeChatId, messageId, improved);
+      }
+    } catch (e) {
+      console.error('AI message improve error', e);
+      setAiError(e instanceof Error ? e.message : 'Не удалось исправить сообщение');
+    } finally {
+      setAiFixingMessageId(null);
+    }
   };
 
   const startRecording = async () => {
@@ -236,7 +320,7 @@ export default function ChatView() {
           backgroundSize: 'cover',
           backgroundPosition: 'center'
         }}
-        onClick={() => { setShowEmojiPicker(false); setShowAttachMenu(false); }}
+        onClick={() => { setShowEmojiPicker(false); setShowAttachMenu(false); setAiActionMessageId(null); }}
       >
         {contact.id === 'saved_messages' && contact.messages.length === 0 && (
           <div className="flex-grow flex items-center justify-center p-4">
@@ -267,11 +351,25 @@ export default function ChatView() {
           const onlyEmojis = isOnlyEmojis(msg.text);
           const emojiCount = Array.from(msg.text.replace(/\s/g, '')).length;
           const isJumbo = onlyEmojis && emojiCount <= 5 && !msg.audioUrl && !msg.fileUrl;
+          const canAiFix =
+            msg.type === 'sent' &&
+            !msg.audioUrl &&
+            !msg.fileUrl &&
+            !!msg.text &&
+            !isJumbo &&
+            msg.id !== 'dummy';
+          const isAiActionOpen = aiActionMessageId === msg.id;
+          const isAiFixingThis = aiFixingMessageId === msg.id;
 
           return (
-            <div 
-              key={msg.id} 
-              className={`message max-w-[75%] px-3 py-1.5 mb-1.5 rounded-[18px] relative break-words flex flex-col ${
+            <div
+              key={msg.id}
+              onClick={(e) => {
+                if (!canAiFix) return;
+                e.stopPropagation();
+                setAiActionMessageId(prev => (prev === msg.id ? null : msg.id));
+              }}
+              className={`message max-w-[75%] px-3 py-1.5 mb-1.5 rounded-[18px] relative break-words flex flex-col ${canAiFix ? 'cursor-pointer' : ''} ${
                 isJumbo 
                   ? `bg-transparent ${msg.type === 'sent' ? 'self-end' : 'self-start'}`
                   : msg.type === 'sent' 
@@ -279,6 +377,28 @@ export default function ChatView() {
                     : 'bg-tg-received-bubble self-start rounded-bl-[5px] message-tail-received shadow-sm text-[15px] leading-snug'
               }`}
             >
+              {canAiFix && isAiActionOpen && (
+                <div
+                  className="absolute -top-12 right-0 z-30"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    onClick={() => handleAiFixMessage(msg.id, msg.text)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white text-[13px] font-medium shadow-lg hover:brightness-110 active:scale-95 transition"
+                  >
+                    <Sparkles size={14} />
+                    AI исправление
+                  </button>
+                </div>
+              )}
+              {isAiFixingThis && (
+                <div className="absolute inset-0 rounded-[18px] bg-white/70 flex items-center justify-center z-20">
+                  <div className="flex items-center gap-1.5 text-violet-600 text-[13px] font-medium">
+                    <Loader2 size={14} className="animate-spin" />
+                    AI исправляет...
+                  </div>
+                </div>
+              )}
               {msg.audioUrl ? (
                 <div className="mb-1">
                   <audio controls src={msg.audioUrl} className="h-8 w-48" />
@@ -304,6 +424,7 @@ export default function ChatView() {
                 isJumbo ? 'bg-black/20 text-white px-1.5 py-0.5 rounded-full backdrop-blur-sm mt-1' :
                 msg.type === 'sent' ? 'text-[#70a050]' : 'text-tg-secondary-text'
               }`}>
+                {msg.editedAt && <span className="italic opacity-70">изм.</span>}
                 <span>{msg.time}</span>
                 {msg.type === 'sent' && (
                   msg.status === 'sending' ? <Clock size={12} /> :
@@ -398,6 +519,31 @@ export default function ChatView() {
               disabled={isRecording}
               className="flex-grow border-none outline-none py-2 px-1 text-[16px] bg-transparent resize-none max-h-[100px] leading-snug m-0 self-stretch placeholder-tg-placeholder-text text-tg-text-primary disabled:opacity-50"
             />
+            {!isRecording && inputText.trim() && (
+              <button
+                onClick={handleAiFixInput}
+                disabled={aiFixingInput}
+                title={
+                  aiTrialStart
+                    ? isAiTrialActive()
+                      ? `AI исправление (бесплатно ещё ${formatTrialLeft(aiTrialMsLeft())})`
+                      : 'AI исправление (требуется Premium)'
+                    : 'AI исправление: первый день бесплатно'
+                }
+                className="p-1.5 text-violet-500 hover:text-violet-600 disabled:opacity-50 transition-colors relative"
+              >
+                {aiFixingInput ? (
+                  <Loader2 size={22} className="animate-spin" />
+                ) : (
+                  <Wand2 size={22} />
+                )}
+                {!aiTrialStart && !aiFixingInput && (
+                  <span className="absolute -top-0.5 -right-0.5 bg-violet-500 text-white text-[9px] leading-none rounded-full px-1 py-0.5 font-semibold">
+                    NEW
+                  </span>
+                )}
+              </button>
+            )}
             {!isRecording && (
               <button 
                 onClick={() => setShowEmojiPicker(!showEmojiPicker)}
@@ -472,6 +618,65 @@ export default function ChatView() {
               </div>
             </motion.div>
           </div>
+        )}
+      </AnimatePresence>
+
+      {/* AI Paywall Modal */}
+      <AnimatePresence>
+        {showPaywall && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/50" onClick={() => setShowPaywall(false)}
+            />
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-white rounded-2xl shadow-xl w-full max-w-sm overflow-hidden z-10"
+            >
+              <div className="p-5 text-center">
+                <div className="w-16 h-16 rounded-full bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white mx-auto flex items-center justify-center mb-4 shadow-md">
+                  <Sparkles size={28} />
+                </div>
+                <h3 className="text-[18px] font-semibold text-black mb-2">
+                  Пробный период закончился
+                </h3>
+                <p className="text-[14px] text-gray-600 leading-relaxed">
+                  Первые 24 часа AI исправление сообщений было бесплатным. Чтобы и дальше пользоваться улучшением текста с помощью AI, оформите HouseGram&nbsp;Premium.
+                </p>
+              </div>
+              <div className="flex border-t border-gray-200">
+                <button
+                  onClick={() => setShowPaywall(false)}
+                  className="flex-1 py-3 text-[16px] font-medium text-gray-500 hover:bg-gray-50 transition-colors border-r border-gray-200"
+                >
+                  Позже
+                </button>
+                <button
+                  onClick={() => setShowPaywall(false)}
+                  className="flex-1 py-3 text-[16px] font-medium text-violet-600 hover:bg-gray-50 transition-colors"
+                >
+                  Подключить
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* AI Error Toast */}
+      <AnimatePresence>
+        {aiError && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 20 }}
+            className="absolute bottom-20 left-1/2 -translate-x-1/2 z-50 bg-red-500 text-white text-[13px] rounded-full px-4 py-2 shadow-lg flex items-center gap-2 max-w-[90%]"
+          >
+            <span className="truncate">{aiError}</span>
+            <button onClick={() => setAiError(null)} className="opacity-80 hover:opacity-100">
+              <X size={14} />
+            </button>
+          </motion.div>
         )}
       </AnimatePresence>
 

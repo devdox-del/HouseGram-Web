@@ -11,6 +11,7 @@ export interface Message {
   fileName?: string;
   senderId?: string;
   createdAt?: any;
+  editedAt?: any;
   chatId?: string;
 }
 

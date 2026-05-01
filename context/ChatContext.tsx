@@ -8,6 +8,9 @@ import { onAuthStateChanged, User, signOut } from 'firebase/auth';
 import { doc, getDoc, setDoc, onSnapshot, updateDoc, serverTimestamp, addDoc, collection, query, orderBy, where } from 'firebase/firestore';
 import { GoogleGenAI } from '@google/genai';
 
+const AI_TRIAL_DURATION_MS = 24 * 60 * 60 * 1000;
+const AI_TRIAL_STORAGE_KEY = 'housegram_ai_trial_start';
+
 let aiInstance: GoogleGenAI | null = null;
 const getAi = () => {
   if (!aiInstance && process.env.NEXT_PUBLIC_GEMINI_API_KEY) {
@@ -50,6 +53,12 @@ interface ChatContextType {
   isMaintenance: boolean;
   logout: () => void;
   addContact: (contact: Contact) => void;
+  improveWithAI: (text: string) => Promise<string>;
+  updateMessageText: (contactId: string, messageId: string, newText: string) => Promise<void>;
+  aiTrialStart: number | null;
+  startAiTrial: () => number;
+  isAiTrialActive: () => boolean;
+  aiTrialMsLeft: () => number;
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
@@ -77,6 +86,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
   const [isAdmin, setIsAdmin] = useState(false);
   const [isMaintenance, setIsMaintenance] = useState(false);
   const [authReady, setAuthReady] = useState(false);
+  const [aiTrialStart, setAiTrialStart] = useState<number | null>(null);
 
   const settingsRef = useRef({ soundEnabled, notificationsEnabled });
 
@@ -98,10 +108,15 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
     }
     const savedNotif = localStorage.getItem('housegram_notif');
     const savedSound = localStorage.getItem('housegram_sound');
+    const savedAiTrial = localStorage.getItem(AI_TRIAL_STORAGE_KEY);
     
     Promise.resolve().then(() => {
       if (savedNotif !== null) setNotificationsEnabled(savedNotif === 'true');
       if (savedSound !== null) setSoundEnabled(savedSound === 'true');
+      if (savedAiTrial) {
+        const ts = Number(savedAiTrial);
+        if (!Number.isNaN(ts)) setAiTrialStart(ts);
+      }
     });
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
@@ -538,6 +553,58 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
     return () => unsubscribe();
   }, [activeChatId, user]);
 
+  const startAiTrial = useCallback(() => {
+    const now = Date.now();
+    setAiTrialStart(now);
+    localStorage.setItem(AI_TRIAL_STORAGE_KEY, String(now));
+    return now;
+  }, []);
+
+  const aiTrialMsLeft = useCallback(() => {
+    if (!aiTrialStart) return AI_TRIAL_DURATION_MS;
+    return Math.max(0, AI_TRIAL_DURATION_MS - (Date.now() - aiTrialStart));
+  }, [aiTrialStart]);
+
+  const isAiTrialActive = useCallback(() => {
+    if (!aiTrialStart) return true;
+    return Date.now() - aiTrialStart < AI_TRIAL_DURATION_MS;
+  }, [aiTrialStart]);
+
+  const improveWithAI = useCallback(async (text: string): Promise<string> => {
+    const trimmed = text.trim();
+    if (!trimmed) return text;
+    const ai = getAi();
+    if (!ai) {
+      throw new Error('AI недоступен: не настроен NEXT_PUBLIC_GEMINI_API_KEY.');
+    }
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: trimmed,
+      config: {
+        systemInstruction:
+          'Ты — редактор-корректор в мессенджере HouseGram. Получаешь черновик сообщения и возвращаешь улучшенную версию: исправляешь грамматику, орфографию и пунктуацию, делаешь формулировку более ясной и естественной, сохраняешь исходный язык, тон и эмодзи. Никогда не добавляй пояснений, кавычек или префиксов вроде «Исправлено:» — отвечай только готовым текстом сообщения.',
+        temperature: 0.4,
+      },
+    });
+    const improved = (response.text || '').trim();
+    if (!improved) throw new Error('AI вернул пустой ответ');
+    return improved.replace(/^["«]+|["»]+$/g, '');
+  }, []);
+
+  const updateMessageText = useCallback(async (contactId: string, messageId: string, newText: string) => {
+    if (!auth.currentUser) return;
+    const chatId = [auth.currentUser.uid, contactId].sort().join('_');
+    await updateDoc(doc(db, 'chats', chatId, 'messages', messageId), {
+      text: newText,
+      editedAt: serverTimestamp(),
+    });
+    const chatDocRef = doc(db, 'chats', chatId);
+    const chatSnap = await getDoc(chatDocRef);
+    if (chatSnap.exists() && chatSnap.data().lastMessageSenderId === auth.currentUser.uid) {
+      await updateDoc(chatDocRef, { lastMessage: newText });
+    }
+  }, []);
+
   const updateUserProfile = useCallback(async (profile: UserProfile) => {
     setUserProfile(profile);
     if (auth.currentUser) {
@@ -572,7 +639,9 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
       notificationsEnabled, setNotificationsEnabled: (val: boolean) => { setNotificationsEnabled(val); localStorage.setItem('housegram_notif', String(val)); },
       soundEnabled, setSoundEnabled: (val: boolean) => { setSoundEnabled(val); localStorage.setItem('housegram_sound', String(val)); },
       passcode, isLocked, setIsLocked, updatePasscode,
-      user, isAdmin, isMaintenance, logout
+      user, isAdmin, isMaintenance, logout,
+      improveWithAI, updateMessageText,
+      aiTrialStart, startAiTrial, isAiTrialActive, aiTrialMsLeft
     }}>
       {!authReady ? (
         <div className="absolute inset-0 flex items-center justify-center bg-white z-50">
