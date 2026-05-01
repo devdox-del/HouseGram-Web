@@ -8,6 +8,9 @@ import { onAuthStateChanged, User, signOut } from 'firebase/auth';
 import { doc, getDoc, setDoc, onSnapshot, updateDoc, serverTimestamp, addDoc, collection, query, orderBy, where } from 'firebase/firestore';
 import { GoogleGenAI } from '@google/genai';
 
+const AI_TRIAL_DURATION_MS = 24 * 60 * 60 * 1000;
+const AI_TRIAL_STORAGE_KEY = 'housegram_ai_trial_start';
+
 let aiInstance: GoogleGenAI | null = null;
 const getAi = () => {
   if (!aiInstance && process.env.NEXT_PUBLIC_GEMINI_API_KEY) {
@@ -50,6 +53,12 @@ interface ChatContextType {
   isMaintenance: boolean;
   logout: () => void;
   addContact: (contact: Contact) => void;
+  improveWithAI: (text: string) => Promise<string>;
+  updateMessageText: (contactId: string, messageId: string, newText: string) => Promise<void>;
+  aiTrialStart: number | null;
+  startAiTrial: () => number;
+  isAiTrialActive: () => boolean;
+  aiTrialMsLeft: () => number;
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
@@ -77,6 +86,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
   const [isAdmin, setIsAdmin] = useState(false);
   const [isMaintenance, setIsMaintenance] = useState(false);
   const [authReady, setAuthReady] = useState(false);
+  const [aiTrialStart, setAiTrialStart] = useState<number | null>(null);
 
   const settingsRef = useRef({ soundEnabled, notificationsEnabled });
 
@@ -98,10 +108,15 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
     }
     const savedNotif = localStorage.getItem('housegram_notif');
     const savedSound = localStorage.getItem('housegram_sound');
+    const savedAiTrial = localStorage.getItem(AI_TRIAL_STORAGE_KEY);
     
     Promise.resolve().then(() => {
       if (savedNotif !== null) setNotificationsEnabled(savedNotif === 'true');
       if (savedSound !== null) setSoundEnabled(savedSound === 'true');
+      if (savedAiTrial) {
+        const ts = Number(savedAiTrial);
+        if (!Number.isNaN(ts)) setAiTrialStart(ts);
+      }
     });
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
@@ -538,6 +553,129 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
     return () => unsubscribe();
   }, [activeChatId, user]);
 
+  const startAiTrial = useCallback(() => {
+    const now = Date.now();
+    setAiTrialStart(now);
+    localStorage.setItem(AI_TRIAL_STORAGE_KEY, String(now));
+    return now;
+  }, []);
+
+  const aiTrialMsLeft = useCallback(() => {
+    if (!aiTrialStart) return AI_TRIAL_DURATION_MS;
+    return Math.max(0, AI_TRIAL_DURATION_MS - (Date.now() - aiTrialStart));
+  }, [aiTrialStart]);
+
+  const isAiTrialActive = useCallback(() => {
+    if (!aiTrialStart) return true;
+    return Date.now() - aiTrialStart < AI_TRIAL_DURATION_MS;
+  }, [aiTrialStart]);
+
+  const improveWithAI = useCallback(async (text: string): Promise<string> => {
+    const trimmed = text.trim();
+    if (!trimmed) return text;
+
+    const systemPrompt =
+      'Исправь грамматику, орфографию и пунктуацию в тексте. Сохрани язык, тон и эмодзи. Верни только готовый исправленный текст без пояснений и кавычек.';
+
+    const cleanResponse = (raw: string): string => {
+      const cleaned = raw.trim().replace(/^["«]+|["»]+$/g, '').trim();
+      if (!cleaned) throw new Error('AI вернул пустой ответ');
+      return cleaned;
+    };
+
+    const looksLikeDeprecationNotice = (s: string) => {
+      const lower = s.toLowerCase();
+      return (
+        s.includes('IMPORTANT NOTICE') ||
+        lower.includes('deprecated') ||
+        lower.includes('pollinations legacy') ||
+        s.startsWith('⚠')
+      );
+    };
+
+    // Primary: free, no-key Pollinations.ai (OpenAI-compatible).
+    try {
+      const res = await fetch('https://text.pollinations.ai/openai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [
+            { role: 'user', content: `${systemPrompt}\n\nТекст: ${trimmed}` },
+          ],
+        }),
+      });
+      if (!res.ok) throw new Error(`Pollinations HTTP ${res.status}`);
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content === 'string' && content.trim()) {
+        if (looksLikeDeprecationNotice(content)) {
+          throw new Error('Pollinations вернул системное уведомление, пробуем резервный сервис');
+        }
+        return cleanResponse(content);
+      }
+      throw new Error('Pollinations вернул пустой ответ');
+    } catch (pollErr) {
+      console.warn('Pollinations AI failed, trying LanguageTool fallback', pollErr);
+    }
+
+    // Fallback 1: LanguageTool — free, no-key grammar/spell-check API.
+    try {
+      const params = new URLSearchParams();
+      params.set('text', trimmed);
+      params.set('language', 'auto');
+      const res = await fetch('https://api.languagetool.org/v2/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      });
+      if (!res.ok) throw new Error(`LanguageTool HTTP ${res.status}`);
+      const data = await res.json();
+      const matches: Array<{ offset: number; length: number; replacements: { value: string }[] }> =
+        Array.isArray(data?.matches) ? data.matches : [];
+      const valid = matches
+        .filter((m) => Array.isArray(m?.replacements) && m.replacements.length > 0 && typeof m.offset === 'number' && typeof m.length === 'number')
+        .sort((a, b) => b.offset - a.offset);
+      if (valid.length === 0) {
+        // No corrections suggested — return as-is so the user knows it was checked.
+        return trimmed;
+      }
+      let result = trimmed;
+      for (const m of valid) {
+        const replacement = m.replacements[0].value;
+        result = result.slice(0, m.offset) + replacement + result.slice(m.offset + m.length);
+      }
+      return cleanResponse(result);
+    } catch (ltErr) {
+      console.warn('LanguageTool failed, trying Gemini fallback', ltErr);
+    }
+
+    // Fallback 2: Gemini, if a key is configured.
+    const ai = getAi();
+    if (!ai) {
+      throw new Error('AI временно недоступен. Попробуйте ещё раз через минуту.');
+    }
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: trimmed,
+      config: { systemInstruction: systemPrompt, temperature: 0.4 },
+    });
+    return cleanResponse(response.text || '');
+  }, []);
+
+  const updateMessageText = useCallback(async (contactId: string, messageId: string, newText: string) => {
+    if (!auth.currentUser) return;
+    const chatId = [auth.currentUser.uid, contactId].sort().join('_');
+    await updateDoc(doc(db, 'chats', chatId, 'messages', messageId), {
+      text: newText,
+      editedAt: serverTimestamp(),
+    });
+    const chatDocRef = doc(db, 'chats', chatId);
+    const chatSnap = await getDoc(chatDocRef);
+    if (chatSnap.exists() && chatSnap.data().lastMessageSenderId === auth.currentUser.uid) {
+      await updateDoc(chatDocRef, { lastMessage: newText });
+    }
+  }, []);
+
   const updateUserProfile = useCallback(async (profile: UserProfile) => {
     setUserProfile(profile);
     if (auth.currentUser) {
@@ -572,7 +710,9 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
       notificationsEnabled, setNotificationsEnabled: (val: boolean) => { setNotificationsEnabled(val); localStorage.setItem('housegram_notif', String(val)); },
       soundEnabled, setSoundEnabled: (val: boolean) => { setSoundEnabled(val); localStorage.setItem('housegram_sound', String(val)); },
       passcode, isLocked, setIsLocked, updatePasscode,
-      user, isAdmin, isMaintenance, logout
+      user, isAdmin, isMaintenance, logout,
+      improveWithAI, updateMessageText,
+      aiTrialStart, startAiTrial, isAiTrialActive, aiTrialMsLeft
     }}>
       {!authReady ? (
         <div className="absolute inset-0 flex items-center justify-center bg-white z-50">
